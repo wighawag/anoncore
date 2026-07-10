@@ -1,0 +1,9 @@
+# anoncore is a LIBRARY: no binary is built here, so there is nothing to ignore
+# from a bare `go build`. Keep the standard Go noise out regardless.
+
+# test/coverage artifacts
+*.out
+coverage.txt
+
+# editor/OS cruft
+.DS_Store
