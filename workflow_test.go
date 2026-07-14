@@ -9,26 +9,26 @@ import (
 
 // The CI workflow (.github/workflows/ci.yml) is the unit gate that runs on every
 // push/PR. Its gate command MUST be the repo's single source of truth: the exact
-// `.dorfl.json` verify string (gofmt check + go vet + go build + go test, unit
+// `dorfl.json` verify string (gofmt check + go vet + go build + go test, unit
 // only). These tests pin that contract so the workflow cannot silently drift from
 // the acceptance gate a human/runner drives locally.
 
-// dorflVerify reads the verify command out of .dorfl.json (the single source of
+// dorflVerify reads the verify command out of dorfl.json (the single source of
 // truth for the acceptance gate).
 func dorflVerify(t *testing.T) string {
 	t.Helper()
-	raw, err := os.ReadFile(".dorfl.json")
+	raw, err := os.ReadFile("dorfl.json")
 	if err != nil {
-		t.Fatalf("read .dorfl.json: %v", err)
+		t.Fatalf("read dorfl.json: %v", err)
 	}
 	var cfg struct {
 		Verify string `json:"verify"`
 	}
 	if err := json.Unmarshal(raw, &cfg); err != nil {
-		t.Fatalf("parse .dorfl.json: %v", err)
+		t.Fatalf("parse dorfl.json: %v", err)
 	}
 	if cfg.Verify == "" {
-		t.Fatal(".dorfl.json has an empty verify command")
+		t.Fatal("dorfl.json has an empty verify command")
 	}
 	return cfg.Verify
 }
@@ -43,15 +43,15 @@ func ciWorkflow(t *testing.T) string {
 	return string(raw)
 }
 
-// The CI workflow must run the EXACT `.dorfl.json` verify command verbatim, so
+// The CI workflow must run the EXACT `dorfl.json` verify command verbatim, so
 // the push/PR gate and the local acceptance gate can never diverge (criterion:
-// single source of truth). If .dorfl.json changes its verify, this test forces
+// single source of truth). If dorfl.json changes its verify, this test forces
 // ci.yml to be updated too.
 func TestCIRunsExactDorflVerifyGate(t *testing.T) {
 	verify := dorflVerify(t)
 	wf := ciWorkflow(t)
 	if !strings.Contains(wf, verify) {
-		t.Errorf("ci.yml does not run the exact .dorfl.json verify gate.\nwant to find verbatim:\n\t%s\nin the workflow", verify)
+		t.Errorf("ci.yml does not run the exact dorfl.json verify gate.\nwant to find verbatim:\n\t%s\nin the workflow", verify)
 	}
 }
 
