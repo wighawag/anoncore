@@ -3,10 +3,14 @@ package provision_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	acct "github.com/wighawag/anoncore/account"
 
 	"github.com/wighawag/anoncore/endpoint"
 	"github.com/wighawag/anoncore/marker"
@@ -25,6 +29,41 @@ func stubLoginEnv(t *testing.T) {
 	old := provision.WriteLoginEnv
 	provision.WriteLoginEnv = func(context.Context, provision.Runner, string, string) error { return nil }
 	t.Cleanup(func() { provision.WriteLoginEnv = old })
+}
+
+// Fake shells for the unit tests: absolute paths in the NixOS shape (a stable
+// alias under /run/current-system/sw/bin, NOT an FHS path), so a test that
+// asserts the useradd argv cannot accidentally pass by matching a conventional
+// string the production code hard-coded.
+const (
+	fakeLoginShell   = "/run/current-system/sw/bin/bash"
+	fakeNologinShell = "/run/current-system/sw/bin/nologin"
+)
+
+// stubShells pins shell resolution to a FIXED pair for ONE unit test and restores
+// it on cleanup, so the test asserts the argv provisioning builds WITHOUT
+// depending on which shells happen to be installed on the machine running the
+// tests (the point of making the resolver injectable). It is deliberately
+// per-test rather than a global TestMain stub, for the same reason stubLoginEnv
+// is: a global mutation leaks into the integration test binary, where the REAL
+// resolver must run.
+func stubShells(t *testing.T) {
+	t.Helper()
+	old := provision.Shells
+	provision.Shells = provision.ShellResolver{
+		Look: func(name string) (string, error) {
+			switch name {
+			case "bash":
+				return fakeLoginShell, nil
+			case "nologin":
+				return fakeNologinShell, nil
+			}
+			return "", errors.New("executable file not found in $PATH")
+		},
+		Stat:       func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
+		ShellsFile: filepath.Join(t.TempDir(), "no-etc-shells"),
+	}
+	t.Cleanup(func() { provision.Shells = old })
 }
 
 // fakeRunner is the unit-test seam standing in for the real ExecRunner: it
@@ -112,6 +151,7 @@ func joined(calls [][]string) string {
 // dedicated shim service account, via the injected Runner (no real useradd).
 func TestAddProvisionsAccountAndShim(t *testing.T) {
 	stubLoginEnv(t)
+	stubShells(t)
 	r := &fakeRunner{}
 	res, err := provision.Add(context.Background(), r, "anon")
 	if err != nil {
@@ -155,6 +195,7 @@ func TestAddIdempotent(t *testing.T) {
 // A named account provisions anon-<name> and its OWN shim anon-<name>-shim.
 func TestAddNamed(t *testing.T) {
 	stubLoginEnv(t)
+	stubShells(t)
 	r := &fakeRunner{}
 	if _, err := provision.Add(context.Background(), r, "anon-work"); err != nil {
 		t.Fatalf("Add error: %v", err)
@@ -336,6 +377,7 @@ func TestStatus_WithMarker_MissingIsCleanNotForced(t *testing.T) {
 // a socket the anon account could own via `sudo` would carry a DIFFERENT uid and
 // escape the `meta skuid` forcing, so `add` must never grant it.
 func TestAddGrantsNoSudo(t *testing.T) {
+	stubShells(t)
 	stubLoginEnv(t)
 	r := &fakeRunner{}
 	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
@@ -369,6 +411,7 @@ func TestAddWritesMinimalLoginPATH(t *testing.T) {
 		return nil
 	}
 	t.Cleanup(func() { provision.WriteLoginEnv = old })
+	stubShells(t)
 
 	r := &fakeRunner{}
 	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
@@ -583,5 +626,204 @@ func TestStatusAmbiguousOutputReadsAsUnknown(t *testing.T) {
 				t.Errorf("SudoAllowed = true on an ambiguous probe (%s): must never false-alarm", name)
 			}
 		})
+	}
+}
+
+// homeRunner is the seam for exercising the REAL (default) WriteLoginEnv without
+// root: `getent passwd` answers with a passwd line whose home field is a temp
+// dir, so the writer writes a real file into a scratch home and its chown flows
+// through as a recorded call instead of a privileged mutation.
+type homeRunner struct {
+	home  string
+	calls [][]string
+}
+
+func (r *homeRunner) Run(_ context.Context, name string, args ...string) (string, string, error) {
+	r.calls = append(r.calls, append([]string{name}, args...))
+	if name == "getent" && len(args) >= 2 && args[0] == "passwd" {
+		return args[1] + ":x:30034:100::" + r.home + ":" + fakeLoginShell, "", nil
+	}
+	return "", "", nil
+}
+
+// TestWriteLoginEnvChownDoesNotAssumeAUserPrivateGroup is the regression pin for
+// the OBSERVED failure: `anonctl add livetest` aborted on NixOS with
+//
+//	chown "/home/anon-livetest/.profile" to anon-livetest: exit status 1:
+//	chown: invalid group: 'anon-livetest:anon-livetest'
+//
+// The `<account>:<account>` operand hard-codes the Debian/Ubuntu user-private-group
+// convention (USERGROUPS_ENAB yes). NixOS sets GROUP=100 in /etc/default/useradd,
+// so the account lands in the shared `users` group and NO per-user group is ever
+// created (`getent group anon-livetest` returns nothing) - so the group half of
+// the operand names a group that does not exist. The trailing-colon form
+// `<account>:` asks coreutils to use "that user's login group", which is the
+// per-user group on Debian and `users` on NixOS: one operand, both hosts, no
+// group lookup and no distro branch.
+//
+// It asserts the ARGUMENTS through the Runner seam (a real chown needs root), and
+// the account name deliberately differs from any group name a test could match by
+// accident.
+func TestWriteLoginEnvChownDoesNotAssumeAUserPrivateGroup(t *testing.T) {
+	home := t.TempDir()
+	r := &homeRunner{home: home}
+
+	if err := provision.WriteLoginEnv(context.Background(), r, "anon-livetest", "export PATH=/bin\n"); err != nil {
+		t.Fatalf("WriteLoginEnv: %v", err)
+	}
+
+	var chown []string
+	for _, c := range r.calls {
+		if len(c) > 0 && c[0] == "chown" {
+			chown = c
+			break
+		}
+	}
+	if chown == nil {
+		t.Fatalf("WriteLoginEnv issued no chown; calls:\n%s", joined(r.calls))
+	}
+	want := []string{"chown", acct.ChownOperand("anon-livetest"), filepath.Join(home, ".profile")}
+	if strings.Join(chown, " ") != strings.Join(want, " ") {
+		t.Errorf("chown argv = %q, want %q", chown, want)
+	}
+	// The operand must be `<account>:` exactly: a TRAILING COLON and NO group name.
+	if chown[1] != "anon-livetest:" {
+		t.Errorf("chown operand = %q, want %q (trailing colon, no group name)", chown[1], "anon-livetest:")
+	}
+	if strings.Contains(strings.TrimSuffix(chown[1], ":"), ":") {
+		t.Errorf("chown operand %q names a GROUP explicitly; a same-named user-private group does not exist on every distribution (NixOS puts the account in `users`)", chown[1])
+	}
+}
+
+// TestAddResolvesShellsAndNeverNamesAnFHSPath pins the second and third bugs: the
+// shells written into passwd are RESOLVED on the host, not assumed.
+//
+// `useradd --shell /bin/bash` only WARNS when the shell is missing and creates the
+// account anyway, so on NixOS (no /bin/bash, no /usr/sbin/nologin, no /sbin/nologin,
+// no /bin/false) the old code left a login account whose shell does not exist -
+// which is what breaks `use`. The assertion is on the argv through the Runner seam:
+// the useradd calls must carry exactly what the injected resolver returned.
+func TestAddResolvesShellsAndNeverNamesAnFHSPath(t *testing.T) {
+	stubLoginEnv(t)
+	stubShells(t)
+	r := &fakeRunner{}
+	if _, err := provision.Add(context.Background(), r, "anon"); err != nil {
+		t.Fatalf("Add error: %v", err)
+	}
+
+	var login, shim []string
+	for _, c := range r.calls {
+		if len(c) == 0 || c[0] != "useradd" {
+			continue
+		}
+		if strings.Contains(strings.Join(c, " "), "--system") {
+			shim = c
+			continue
+		}
+		login = c
+	}
+	if login == nil || shim == nil {
+		t.Fatalf("expected a login and a shim useradd; got:\n%s", joined(r.calls))
+	}
+
+	assertShell := func(kind string, argv []string, want string) {
+		t.Helper()
+		var got string
+		for i, a := range argv {
+			if a == "--shell" && i+1 < len(argv) {
+				got = argv[i+1]
+			}
+		}
+		if got != want {
+			t.Errorf("%s useradd --shell = %q, want the RESOLVED %q", kind, got, want)
+		}
+	}
+	assertShell("login", login, fakeLoginShell)
+	assertShell("shim", shim, fakeNologinShell)
+
+	// No provisioning command may name a conventional FHS shell path: every one of
+	// these is absent on NixOS, and useradd accepts a missing shell with only a
+	// warning, so an assumed path is a silently bad passwd entry.
+	for _, c := range r.calls {
+		line := strings.Join(c, " ")
+		for _, assumed := range []string{"/bin/bash", "/usr/sbin/nologin", "/sbin/nologin", "/bin/false"} {
+			if strings.Contains(line, " "+assumed) {
+				t.Errorf("provisioning must not hard-code the FHS path %q (it does not exist on every distribution); offending command: %q", assumed, line)
+			}
+		}
+	}
+}
+
+// TestAddRefusesBeforeCreatingAnythingWhenAShellCannotBeResolved is the
+// HALF-PROVISIONED-RESIDUE pin, which is why the observed failure mattered beyond
+// its error message: the aborted `anonctl add` left the login account existing,
+// no shim, and no forcing installed - a state an operator has to unpick by hand.
+//
+// So an unresolvable shell must be refused BEFORE the first mutation: no useradd
+// at all, and no login env written. Resolution happens up front for BOTH accounts,
+// never lazily at each account's creation.
+func TestAddRefusesBeforeCreatingAnythingWhenAShellCannotBeResolved(t *testing.T) {
+	var wroteEnv bool
+	old := provision.WriteLoginEnv
+	provision.WriteLoginEnv = func(context.Context, provision.Runner, string, string) error {
+		wroteEnv = true
+		return nil
+	}
+	t.Cleanup(func() { provision.WriteLoginEnv = old })
+
+	// A host with a perfectly good login shell but NO resolvable nologin: the lazy
+	// order would create the login account first and only then discover the problem.
+	oldShells := provision.Shells
+	provision.Shells = provision.ShellResolver{
+		Look: func(name string) (string, error) {
+			if name == "bash" {
+				return fakeLoginShell, nil
+			}
+			return "", errors.New("executable file not found in $PATH")
+		},
+		Stat:       func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
+		ShellsFile: filepath.Join(t.TempDir(), "no-etc-shells"),
+	}
+	t.Cleanup(func() { provision.Shells = oldShells })
+
+	r := &fakeRunner{}
+	res, err := provision.Add(context.Background(), r, "anon")
+	if err == nil {
+		t.Fatalf("Add must fail when a shell cannot be resolved; got %+v", res)
+	}
+	if !strings.Contains(err.Error(), "nologin") {
+		t.Errorf("error %q must name the shell it could not resolve", err)
+	}
+	if res.Created || res.ShimCreated {
+		t.Errorf("Add reported creation on a refused host: %+v", res)
+	}
+	if strings.Contains(joined(r.calls), "useradd") {
+		t.Errorf("a refused Add must create NOTHING (no half-provisioned residue), got:\n%s", joined(r.calls))
+	}
+	if wroteEnv {
+		t.Errorf("a refused Add must not write a login env")
+	}
+}
+
+// TestAddIdempotentNeedsNoShellResolution keeps re-add a PURE no-op: an
+// already-provisioned account is not re-examined against the host's shells, so a
+// box that could not provision today still answers `add` cleanly for accounts it
+// already has.
+func TestAddIdempotentNeedsNoShellResolution(t *testing.T) {
+	oldShells := provision.Shells
+	provision.Shells = provision.ShellResolver{
+		Look:       func(string) (string, error) { return "", errors.New("no shells at all here") },
+		Stat:       func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
+		ShellsFile: filepath.Join(t.TempDir(), "no-etc-shells"),
+	}
+	t.Cleanup(func() { provision.Shells = oldShells })
+
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	res, err := provision.Add(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("re-add on an existing account must be a clean no-op, got: %v", err)
+	}
+	if res.Created || res.ShimCreated {
+		t.Errorf("re-add reported creation: %+v", res)
 	}
 }

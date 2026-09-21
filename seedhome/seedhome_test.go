@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	acct "github.com/wighawag/anoncore/account"
 	"github.com/wighawag/anoncore/seedhome"
 )
 
@@ -58,13 +60,15 @@ func TestSeedCopiesTreeAndChownsToAccount(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(home, ".config", "app", "conf.toml")); err != nil || string(got) != "key=1\n" {
 		t.Errorf("nested conf content = %q, err %v", got, err)
 	}
-	// Every written path (files AND the directories that hold them) is chowned to
-	// account:account. Chowning the dirs too is load-bearing: a root-run seed's
-	// MkdirAll leaves them root-owned, so the account could read the seeded files but
-	// not create new entries under a seeded dir (the `pi` EACCES on .pi/agent/).
+	// Every written path (files AND the directories that hold them) is chowned to the
+	// account, via the trailing-colon operand `anon:` (the account's OWN login group,
+	// whatever the host gave it - see TestSeedChownDoesNotAssumeAUserPrivateGroup).
+	// Chowning the dirs too is load-bearing: a root-run seed's MkdirAll leaves them
+	// root-owned, so the account could read the seeded files but not create new
+	// entries under a seeded dir (the `pi` EACCES on .pi/agent/).
 	chowned := map[string]bool{}
 	for _, c := range r.calls {
-		if len(c) >= 3 && c[0] == "chown" && c[1] == "anon:anon" {
+		if len(c) >= 3 && c[0] == "chown" && c[1] == acct.ChownOperand("anon") {
 			chowned[c[2]] = true
 		}
 	}
@@ -75,8 +79,47 @@ func TestSeedCopiesTreeAndChownsToAccount(t *testing.T) {
 		filepath.Join(home, ".config", "app"), // nested seeded dir too
 	} {
 		if !chowned[want] {
-			t.Errorf("seeded path %q was not chowned to anon:anon (calls: %v)", want, r.calls)
+			t.Errorf("seeded path %q was not chowned to %q (calls: %v)", want, acct.ChownOperand("anon"), r.calls)
 		}
+	}
+}
+
+// TestSeedChownDoesNotAssumeAUserPrivateGroup pins the PORTABLE chown operand for
+// the seeder, the same rule provision pins for the login-env write.
+//
+// The seeder used to issue `chown <account>:<account>`, which hard-codes the
+// Debian/Ubuntu user-private-group convention. On a host that does not create a
+// per-user group - NixOS sets GROUP=100 in /etc/default/useradd, so the account
+// lands in the shared `users` group and `getent group anon-x` returns nothing -
+// that operand fails with `chown: invalid group`, aborting the seed part-way
+// through a tree it has already half-copied. The trailing-colon form `<account>:`
+// asks coreutils for the account's OWN login group and is correct on both.
+func TestSeedChownDoesNotAssumeAUserPrivateGroup(t *testing.T) {
+	tmpl := t.TempDir()
+	home := t.TempDir()
+	writeFile(t, filepath.Join(tmpl, ".bashrc"), 0o644, "export FOO=bar\n")
+	writeFile(t, filepath.Join(tmpl, ".config", "app", "conf.toml"), 0o600, "key=1\n")
+
+	r := &fakeRunner{}
+	if _, err := seedhome.Seed(context.Background(), r, tmpl, home, "anon-work", false); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+
+	var sawChown bool
+	for _, c := range r.calls {
+		if len(c) < 2 || c[0] != "chown" {
+			continue
+		}
+		sawChown = true
+		if c[1] != "anon-work:" {
+			t.Errorf("chown operand = %q, want %q (trailing colon, NO group name: the group must be the account's own login group, not an assumed user-private group)", c[1], "anon-work:")
+		}
+		if strings.Contains(strings.TrimSuffix(c[1], ":"), ":") {
+			t.Errorf("chown operand %q names a GROUP; a same-named user-private group does not exist on every distribution", c[1])
+		}
+	}
+	if !sawChown {
+		t.Fatalf("seed issued no chown at all; calls: %v", r.calls)
 	}
 }
 

@@ -137,21 +137,50 @@ var WriteLoginEnv = writeLoginEnv
 // exists, so re-running add is a clean no-op (AddResult.Created reports which
 // path was taken). Every mutation goes through the Runner, so the unit tests
 // never create a real user.
+//
+// Both accounts' shells are RESOLVED UP FRONT, before the first mutation. That
+// ordering is load-bearing, not tidiness: resolving the shim's nologin shell
+// lazily (at shim-creation time) means a host that cannot name one gets the login
+// account created and then the failure, leaving the HALF-PROVISIONED residue an
+// operator has to clean up by hand - a login account that exists, no shim, and no
+// forcing installed. Refusing first keeps the failure fail-closed in the only
+// sense that matters: nothing was changed. (It mirrors anonctl's
+// systemd.PreflightUnitBinaries, which refuses an unresolvable unit binary before
+// `add` touches the box.)
 func Add(ctx context.Context, r Runner, account string) (AddResult, error) {
 	shim := acct.ShimAccount(account)
 	res := AddResult{Account: account, Shim: shim}
 
-	created, err := ensureLoginAccount(ctx, r, account)
+	loginExists, _, err := accountEntry(ctx, r, account)
 	if err != nil {
 		return res, err
 	}
-	res.Created = created
+	shimExists, _, err := accountEntry(ctx, r, shim)
+	if err != nil {
+		return res, err
+	}
 
-	shimCreated, err := ensureShimAccount(ctx, r, shim)
-	if err != nil {
-		return res, err
+	// Resolve the shells ONLY when something actually needs creating, so a fully
+	// idempotent re-add stays a pure no-op that issues no lookups at all.
+	var shells ResolvedShells
+	if !loginExists || !shimExists {
+		if shells, err = Shells.Resolve(); err != nil {
+			return res, err
+		}
 	}
-	res.ShimCreated = shimCreated
+
+	if !loginExists {
+		if err := createLoginAccount(ctx, r, account, shells.Login); err != nil {
+			return res, err
+		}
+		res.Created = true
+	}
+	if !shimExists {
+		if err := createShimAccount(ctx, r, shim, shells.Nologin); err != nil {
+			return res, err
+		}
+		res.ShimCreated = true
+	}
 	return res, nil
 }
 
@@ -281,49 +310,37 @@ func sudoRights(ctx context.Context, r Runner, account string) sudoprobe.Verdict
 	return sudoprobe.ParseOutput(stdout + "\n" + stderr)
 }
 
-// ensureLoginAccount creates the login account if absent (idempotent). It is a
-// normal --create-home shell user: the operator logs into it and its egress is
-// forced by a later task. Returns whether it created the account.
-func ensureLoginAccount(ctx context.Context, r Runner, account string) (bool, error) {
-	exists, _, err := accountEntry(ctx, r, account)
-	if err != nil {
-		return false, err
-	}
-	if exists {
-		return false, nil
-	}
+// createLoginAccount creates the login account (the caller has already checked it
+// is absent). It is a normal --create-home shell user: the operator logs into it
+// and its egress is forced by a later task. loginShell is the RESOLVED absolute
+// path to its interactive shell, never a conventional guess (see shell.go).
+func createLoginAccount(ctx context.Context, r Runner, account, loginShell string) error {
 	// The login account is created with NO --groups: it is never added to sudo/wheel,
 	// so it has no sudo path (the CLOSE-AT-ADD no-sudo invariant). A sudo'd socket
 	// would carry a different uid and escape the `meta skuid` forcing.
-	if _, stderr, err := r.Run(ctx, "useradd", "--create-home", "--shell", "/bin/bash", account); err != nil {
-		return false, fmt.Errorf("create login account %q: %w: %s", account, err, stderr)
+	if _, stderr, err := r.Run(ctx, "useradd", "--create-home", "--shell", loginShell, account); err != nil {
+		return fmt.Errorf("create login account %q: %w: %s", account, err, stderr)
 	}
 	// Write the account's minimal login PATH (omitting the sbin setuid-network dirs)
 	// only on FRESH creation, so a re-run never clobbers an operator's edited
 	// profile. Failing to write the env is a real provisioning error (the hardening
 	// did not take effect), surfaced to the caller.
 	if err := WriteLoginEnv(ctx, r, account, loginEnvContent()); err != nil {
-		return false, fmt.Errorf("write login env for %q: %w", account, err)
+		return fmt.Errorf("write login env for %q: %w", account, err)
 	}
-	return true, nil
+	return nil
 }
 
-// ensureShimAccount creates the dedicated shim service account if absent
-// (idempotent). It is a --system, --no-create-home, nologin user: it never logs
-// in, it only runs the shim and (later) is the ONLY UID allowed to dial the
-// endpoint. Returns whether it created the account.
-func ensureShimAccount(ctx context.Context, r Runner, shim string) (bool, error) {
-	exists, _, err := accountEntry(ctx, r, shim)
-	if err != nil {
-		return false, err
+// createShimAccount creates the dedicated shim service account (the caller has
+// already checked it is absent). It is a --system, --no-create-home, nologin
+// user: it never logs in, it only runs the shim and (later) is the ONLY UID
+// allowed to dial the endpoint. nologinShell is the RESOLVED absolute path to a
+// login-refusing shell, never a conventional guess (see shell.go).
+func createShimAccount(ctx context.Context, r Runner, shim, nologinShell string) error {
+	if _, stderr, err := r.Run(ctx, "useradd", "--system", "--no-create-home", "--shell", nologinShell, shim); err != nil {
+		return fmt.Errorf("create shim account %q: %w: %s", shim, err, stderr)
 	}
-	if exists {
-		return false, nil
-	}
-	if _, stderr, err := r.Run(ctx, "useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", shim); err != nil {
-		return false, fmt.Errorf("create shim account %q: %w: %s", shim, err, stderr)
-	}
-	return true, nil
+	return nil
 }
 
 // removeAccount deletes an account and its home if present (idempotent: an absent
@@ -360,7 +377,10 @@ const envFileMode = 0o644
 
 // writeLoginEnv is the DEFAULT WriteLoginEnv: it writes the minimal-PATH profile
 // drop-in into the account's home as `.profile`, then chowns it to the account so
-// the login shell (running as the account) reads it. It discovers the home from
+// the login shell (running as the account) reads it. The chown uses the
+// trailing-colon operand (acct.ChownOperand), which gives the file to the
+// account's OWN login group instead of assuming a same-named user-private group
+// exists - the assumption that aborted `add` on NixOS mid-provision. It discovers the home from
 // the passwd entry through the Runner (the same seam the rest of provisioning
 // uses to read account state). Any real error (no home, write failure) is
 // returned so a failed hardening is not silently swallowed. The unit tests
@@ -380,7 +400,7 @@ func writeLoginEnv(ctx context.Context, r Runner, account, content string) error
 	if err := os.Chmod(path, envFileMode); err != nil {
 		return fmt.Errorf("chmod %q: %w", path, err)
 	}
-	if _, stderr, err := r.Run(ctx, "chown", account+":"+account, path); err != nil {
+	if _, stderr, err := r.Run(ctx, "chown", acct.ChownOperand(account), path); err != nil {
 		return fmt.Errorf("chown %q to %s: %w: %s", path, account, err, stderr)
 	}
 	return nil

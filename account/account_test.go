@@ -1,6 +1,7 @@
 package account_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/wighawag/anoncore/account"
@@ -55,6 +56,28 @@ func TestIsAnonLogin(t *testing.T) {
 	for _, name := range notLogins {
 		if account.IsAnonLogin(name) {
 			t.Errorf("IsAnonLogin(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestChownOperandUsesTheTrailingColonForm pins the PORTABLE chown owner operand.
+//
+// `chown <account>:<account>` assumes a user-private group of the same name, which
+// is the Debian/Ubuntu `USERGROUPS_ENAB yes` convention and NOT universal: NixOS
+// sets GROUP=100 in /etc/default/useradd, so an anon account lands in the shared
+// `users` group with no per-user group at all, and the two-name operand fails with
+// `chown: invalid group`. The trailing-colon form asks coreutils for "that user's
+// login group", which resolves correctly on BOTH hosts with no lookup, no branch,
+// and no distro check.
+func TestChownOperandUsesTheTrailingColonForm(t *testing.T) {
+	for _, name := range []string{"anon", "anon-work", "anon-livetest", "anon-shim"} {
+		got := account.ChownOperand(name)
+		if got != name+":" {
+			t.Errorf("ChownOperand(%q) = %q, want %q", name, got, name+":")
+		}
+		// It must name NO group: exactly one colon, at the very end.
+		if strings.Count(got, ":") != 1 || !strings.HasSuffix(got, ":") {
+			t.Errorf("ChownOperand(%q) = %q, want a single TRAILING colon and no group name", name, got)
 		}
 	}
 }

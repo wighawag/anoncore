@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	acct "github.com/wighawag/anoncore/account"
@@ -101,6 +103,40 @@ func TestRealProvisionRoundTrip(t *testing.T) {
 		t.Errorf("%q must pin the minimal login PATH %q; got:\n%s", profile, provision.LoginPATH, data)
 	}
 
+	// The shell written into each account's passwd entry must REALLY EXIST on this
+	// host. This is the assertion no unit test can make (the unit tests assert the
+	// argv against a fake), and it is the one that would have caught the FHS
+	// assumption on a non-Debian box: `useradd --shell /bin/bash` only WARNS when the
+	// shell is missing, so the account is created with a login shell that is not
+	// there and `use` breaks later, far from the cause.
+	for _, a := range []string{account, shim} {
+		shell := passwdShell(ctx, r, a)
+		if shell == "" {
+			t.Errorf("account %q has no shell in its passwd entry", a)
+			continue
+		}
+		if !filepath.IsAbs(shell) {
+			t.Errorf("account %q has a non-absolute login shell %q", a, shell)
+		}
+		if st, serr := os.Stat(shell); serr != nil {
+			t.Errorf("account %q was provisioned with a shell that does not exist: %q (%v)", a, shell, serr)
+		} else if st.IsDir() {
+			t.Errorf("account %q was provisioned with a DIRECTORY as its shell: %q", a, shell)
+		}
+	}
+
+	// The login-env drop-in must be owned by the account, whatever GROUP this host
+	// gave it (a per-user group on Debian, the shared `users` group on NixOS). The
+	// write above already went through the real chown, so reaching here at all means
+	// the portable trailing-colon operand was accepted by the host's chown.
+	if st, serr := os.Stat(profile); serr != nil {
+		t.Errorf("stat %q: %v", profile, serr)
+	} else if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+		if got := strconv.FormatUint(uint64(sys.Uid), 10); got != stAfterWrite(ctx, r, account) {
+			t.Errorf("%q is owned by uid %s, want the account's uid %s", profile, got, stAfterWrite(ctx, r, account))
+		}
+	}
+
 	// Idempotent re-add: a clean no-op, not an error, and no second account.
 	res2, err := provision.Add(ctx, r, account)
 	if err != nil {
@@ -109,6 +145,26 @@ func TestRealProvisionRoundTrip(t *testing.T) {
 	if res2.Created {
 		t.Errorf("re-Add.Created = true, want false (idempotent)")
 	}
+}
+
+// passwdShell returns the account's login shell from its passwd entry (field 7).
+func passwdShell(ctx context.Context, r provision.Runner, account string) string {
+	out, _, _ := r.Run(ctx, "getent", "passwd", account)
+	fields := strings.Split(strings.TrimSpace(out), ":")
+	if len(fields) < 7 {
+		return ""
+	}
+	return fields[6]
+}
+
+// stAfterWrite returns the account's numeric uid from the box, for the ownership
+// assertion above.
+func stAfterWrite(ctx context.Context, r provision.Runner, account string) string {
+	st, err := provision.Status(ctx, r, account)
+	if err != nil {
+		return ""
+	}
+	return st.UID
 }
 
 // passwdHome returns the account's home directory from its passwd entry.

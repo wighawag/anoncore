@@ -32,6 +32,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	acct "github.com/wighawag/anoncore/account"
 )
 
 // Runner abstracts command execution (the chown) so the copy is unit-testable
@@ -70,7 +72,9 @@ type Result struct {
 }
 
 // Seed copies every file under templateDir into home, chowning each written path
-// to account. It is ATOMIC in its collision check: with Force unset it scans for
+// to account via account.ChownOperand (the trailing-colon form, which hands the
+// path to the account's OWN login group rather than assuming a user-private group
+// of the same name exists). It is ATOMIC in its collision check: with Force unset it scans for
 // ALL collisions first and returns an *ErrCollision (writing nothing) if any
 // exist, so a seed never lands a partial set and then aborts. With Force set it
 // overwrites, recording the overwritten paths in the Result.
@@ -148,7 +152,7 @@ func Seed(ctx context.Context, r Runner, templateDir, home, account string, forc
 		// caches, session subdirs): the exact EACCES a tool like `pi` hits when it tries
 		// to mkdir under a seeded `.pi/agent/`. Directories are chowned before the files
 		// so every seeded path ends up account-owned.
-		if _, _, err := r.Run(ctx, "chown", account+":"+account, dst); err != nil {
+		if _, _, err := r.Run(ctx, "chown", acct.ChownOperand(account), dst); err != nil {
 			return res, fmt.Errorf("seed-home: chown dir %q to %s: %w", dst, account, err)
 		}
 	}
@@ -163,7 +167,7 @@ func Seed(ctx context.Context, r Runner, templateDir, home, account string, forc
 		if err := copyFile(src, dst); err != nil {
 			return res, err
 		}
-		if _, _, err := r.Run(ctx, "chown", account+":"+account, dst); err != nil {
+		if _, _, err := r.Run(ctx, "chown", acct.ChownOperand(account), dst); err != nil {
 			return res, fmt.Errorf("seed-home: chown %q to %s: %w", dst, account, err)
 		}
 		res.Copied++

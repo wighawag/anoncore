@@ -54,6 +54,23 @@ func ResolveAccount(name string) string {
 // `anon`.
 func ShimAccount(account string) string { return account + "-shim" }
 
+// ChownOperand returns the `chown` OWNER operand that hands a path to an account
+// AND to that account's own login group, whatever that group happens to be:
+// `<account>:` - the account name followed by a TRAILING COLON and no group name.
+//
+// The colon is load-bearing and the missing group name is the whole point. Per
+// coreutils, "if a colon but no group name follows the user name, that user is
+// made the owner of the files and the group of the files is changed to that
+// user's login group", so the GROUP is whatever the host actually gave the
+// account. The obvious-looking `<account>:<account>` form instead HARD-CODES the
+// Debian/Ubuntu user-private-group convention (`USERGROUPS_ENAB yes`, where
+// useradd creates a per-user group of the same name). That convention is not
+// universal: NixOS sets `GROUP=100` in /etc/default/useradd, so useradd puts the
+// account in the shared `users` group and creates NO per-user group, and
+// `chown anon-x:anon-x` fails with `chown: invalid group`. One operand form is
+// correct on both, with no group lookup and no distro check.
+func ChownOperand(account string) string { return account + ":" }
+
 // IsAnonLogin reports whether a passwd name is an anon LOGIN account (`anon` or
 // `anon-<name>`) and NOT one of the `*-shim` service accounts, which are
 // implementation, not operator-managed accounts.
