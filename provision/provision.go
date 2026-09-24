@@ -81,36 +81,61 @@ type AccountStatus struct {
 	SudoAllowed bool `json:"sudoAllowed"`
 
 	// Forced reports whether the account has a marker (`/etc/anonctl/<account>.json`):
-	// anonctl's own convenience view of the SAME dependency-free truth a sibling
-	// tool reads directly. A missing marker is a clean `false` ("not forced"), never
-	// an error. The marker FILE is authoritative; this field is a reader of it.
-	Forced bool `json:"forced"`
-	// Marker is the account's marker record when present (Forced), else nil. It
-	// carries the endpoint SHARE-CLASS (story 20) but no endpoint URL/creds.
+	// anonctl's own convenience view of the SAME dependency-free truth a sibling tool
+	// reads directly. The marker FILE is authoritative; this field is a reader of it.
+	//
+	// It is a POINTER because there are three answers, not two: a marker was read
+	// (true), its absence was positively established (false), and the read FAILED so
+	// nothing was established (nil). The third is the common case for an unprivileged
+	// caller, and it must not serialise as `false`.
+	Forced *bool `json:"forced"`
+	// Forcing is the same verdict as a tri-state with a REASON, so a consumer that
+	// finds `forced: null` can see why. It is the identical shape `list` emits, on
+	// purpose: the two verbs answer the same question and must not disagree about how
+	// they say "undetermined".
+	Forcing Forcing `json:"forcing"`
+	// Marker is the account's marker record when present, else nil. It carries the
+	// endpoint SHARE-CLASS (story 20) but no endpoint URL/creds.
 	Marker *marker.Marker `json:"marker,omitempty"`
 }
 
 // WithMarker returns a copy of the status with its marker fields populated from
-// the given Store: Forced+Marker when a marker is present, a clean not-forced
-// (Forced=false, Marker=nil) when it is absent (marker.ErrNotFound). A real read
-// error (a corrupt marker) is returned so it is not silently swallowed. This is
-// the READER side of the marker precedence: `status` reports the same file a
-// sibling tool reads directly; it is a convenience view, not a second source of
-// truth. Kept separate from Status so the account-table read stays free of any
-// /etc dependency (and its unit tests need no marker Store).
-func (s AccountStatus) WithMarker(store marker.Store) (AccountStatus, error) {
+// the given Store: forced when a marker is present, a clean not-forced when its
+// absence was established (marker.ErrNotFound), and UNDETERMINED (Forced=nil,
+// Forcing.State=unknown with the reason) when the read failed.
+//
+// It returns NO ERROR, and that is the fix for a real asymmetry. It used to return
+// the read error, and `anonctl status --json` turned that into a non-zero exit with
+// NO DOCUMENT AT ALL - so the verb carrying the most detail was the one a consumer
+// could get no partial truth from, and the single most common cause was simply
+// running without privilege. Worse, it was inconsistent with this verb's own
+// treatment of the LEDGER, where an unreadable record has always been a named state
+// (`record-unreadable`) precisely so it is never collapsed into "absent". An
+// unreadable marker is a STATE of the answer, exactly as it is for `list`, not a
+// reason to refuse to report the eight other things that WERE established.
+//
+// This is the READER side of the marker precedence: `status` reports the same file
+// a sibling tool reads directly; it is a convenience view, not a second source of
+// truth. Kept separate from Status so the account-table read stays free of any /etc
+// dependency (and its unit tests need no marker Store).
+func (s AccountStatus) WithMarker(store marker.Store) AccountStatus {
+	no, yes := false, true
 	m, err := store.Read(s.Account)
-	if err != nil {
-		if errors.Is(err, marker.ErrNotFound) {
-			s.Forced = false
-			s.Marker = nil
-			return s, nil
-		}
-		return s, err
+	switch {
+	case err == nil:
+		s.Forced = &yes
+		s.Marker = &m
+		s.Forcing = Forcing{State: StateForced}
+	case errors.Is(err, marker.ErrNotFound):
+		s.Forced = &no
+		s.Marker = nil
+		s.Forcing = Forcing{State: StateUnforced}
+	default:
+		s.Forced = nil
+		s.Marker = nil
+		s.Forcing = Forcing{State: StateUnknown, Reason: err.Error()}
 	}
-	s.Forced = true
-	s.Marker = &m
-	return s, nil
+	return s
 }
 
 // LoginPATH is the minimal login PATH `add` provisions for the anon account. It

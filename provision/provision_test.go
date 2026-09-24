@@ -336,12 +336,12 @@ func TestStatus_WithMarker_ReportsForced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
-	st, err = st.WithMarker(store)
-	if err != nil {
-		t.Fatalf("WithMarker: %v", err)
-	}
-	if !st.Forced || st.Marker == nil {
+	st = st.WithMarker(store)
+	if st.Forced == nil || !*st.Forced || st.Marker == nil {
 		t.Fatalf("a present marker must set Forced+Marker; got Forced=%v Marker=%v", st.Forced, st.Marker)
+	}
+	if st.Forcing.State != provision.StateForced {
+		t.Errorf("forcing state = %q, want %q", st.Forcing.State, provision.StateForced)
 	}
 	if st.Marker.EndpointClass != endpoint.ClassTorShared {
 		t.Errorf("status must carry the endpoint share-class; got %q", st.Marker.EndpointClass)
@@ -357,12 +357,12 @@ func TestStatus_WithMarker_MissingIsCleanNotForced(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status: %v", err)
 	}
-	st, err = st.WithMarker(store)
-	if err != nil {
-		t.Fatalf("WithMarker (missing) must not error; got %v", err)
+	st = st.WithMarker(store)
+	if st.Forced == nil || *st.Forced || st.Marker != nil {
+		t.Fatalf("a missing marker must be a clean, DETERMINED not-forced; got Forced=%v Marker=%v", st.Forced, st.Marker)
 	}
-	if st.Forced || st.Marker != nil {
-		t.Fatalf("a missing marker must be a clean not-forced; got Forced=%v Marker=%v", st.Forced, st.Marker)
+	if st.Forcing.State != provision.StateUnforced {
+		t.Errorf("forcing state = %q, want %q", st.Forcing.State, provision.StateUnforced)
 	}
 	// And it must appear in status --json as forced:false.
 	b, _ := json.Marshal(st)
@@ -825,5 +825,68 @@ func TestAddIdempotentNeedsNoShellResolution(t *testing.T) {
 	}
 	if res.Created || res.ShimCreated {
 		t.Errorf("re-add reported creation: %+v", res)
+	}
+}
+
+// AN UNREADABLE MARKER IS A STATE, NOT A REFUSAL.
+//
+// WithMarker used to return the read error, and `anonctl status --json` turned that
+// into a non-zero exit with NO DOCUMENT AT ALL - so the verb carrying the most
+// detail was the one a consumer could get no partial truth from, and the usual
+// cause was just running without privilege (the marker dir was 0700 in production;
+// even now the ledger under it is). It was also inconsistent with this same verb's
+// treatment of the LEDGER, where an unreadable record has always been a named state
+// rather than an absence. Everything else about the account was established and
+// must still be reported.
+func TestStatus_WithMarker_UnreadableIsUndeterminedNotAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("models an unprivileged caller; root can read anything")
+	}
+	base := filepath.Join(t.TempDir(), "anonctl")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("seed base: %v", err)
+	}
+	store := marker.Store{BaseDir: base}
+	if err := store.Write(marker.New("anon", "30034", endpoint.ClassTorShared, "1.0.0", time.Now())); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	// Take away the ability to read it, exactly as an unprivileged caller meets it.
+	if err := os.Chmod(base, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(base, 0o755) })
+
+	r := &fakeRunner{present: map[string]bool{"anon": true, "anon-shim": true}}
+	st, err := provision.Status(context.Background(), r, "anon")
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	st = st.WithMarker(store)
+
+	if st.Forced != nil {
+		t.Errorf("an UNREADABLE marker must leave forced null (undetermined); got %v", *st.Forced)
+	}
+	if st.Forcing.State != provision.StateUnknown {
+		t.Errorf("forcing state = %q, want %q", st.Forcing.State, provision.StateUnknown)
+	}
+	if st.Forcing.Reason == "" {
+		t.Error("an undetermined forcing state must carry its reason (the operator's next action depends on it)")
+	}
+	// The rest of the account was established and must survive intact: refusing to
+	// report any of it because ONE field could not be read is the defect.
+	if !st.Exists || st.UID != "30034" || !st.ShimExists {
+		t.Errorf("the established fields must survive an unreadable marker; got %+v", st)
+	}
+
+	// And it must serialise as null, never as false.
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"forced":null`) {
+		t.Errorf("an undetermined marker must serialise as forced:null, never false:\n%s", b)
+	}
+	if !strings.Contains(string(b), `"state":"unknown"`) {
+		t.Errorf("status must carry the tri-state forcing verdict:\n%s", b)
 	}
 }
