@@ -221,8 +221,18 @@ func Rm(ctx context.Context, r Runner, account string, purgeAccount bool) (RmRes
 // reflects ground truth. The shim service accounts (`*-shim`) are excluded: they
 // are implementation, not accounts an operator manages. passwdLines is injected
 // so the enumeration is pure and testable; the CLI shell reads the real table.
-func List(ctx context.Context, r Runner, passwdLines []string) ([]AccountStatus, error) {
-	var out []AccountStatus
+//
+// It returns AccountListing rows, NOT AccountStatus, and the rows it returns are
+// deliberately UNDETERMINED about forcing (Forcing.State == unknown, Managed ==
+// nil) because this function looks at nothing but passwd. Establishing those needs
+// the marker store and the ledger, which is Resolve's job; the two are separate so
+// that this half stays pure of any `/etc` dependency AND so that no code path can
+// emit a confident verdict that nothing computed. That is precisely what the old
+// signature allowed: it returned AccountStatus, whose `forced`/`sudoChecked`/
+// `sudoAllowed` bools this function never touched, and every row of `anonctl list
+// --json` therefore reported a zero-value "false" as though it were an answer.
+func List(ctx context.Context, r Runner, passwdLines []string) ([]AccountListing, error) {
+	var out []AccountListing
 	for _, line := range passwdLines {
 		name, uid, ok := parsePasswd(line)
 		if !ok || !isAnonLogin(name) {
@@ -233,13 +243,17 @@ func List(ctx context.Context, r Runner, passwdLines []string) ([]AccountStatus,
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, AccountStatus{
+		// Bind a per-iteration copy: ShimExists is a pointer (null == not established),
+		// and every row must own its own bool rather than alias a loop variable.
+		shimPresent := shimExists
+		out = append(out, AccountListing{
 			Account:    name,
 			Shim:       shim,
 			Exists:     true,
 			UID:        uid,
-			ShimExists: shimExists,
+			ShimExists: &shimPresent,
 			ShimUID:    shimUID,
+			Forcing:    undetermined(),
 		})
 	}
 	return out, nil

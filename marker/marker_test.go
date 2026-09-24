@@ -240,3 +240,76 @@ func snapshotDir(dir string) string {
 	}
 	return "PRESENT:" + strings.Join(names, ",")
 }
+
+// The boot id is ADDITIVE: a marker written without one round-trips with no
+// `bootId` key at all, so a consumer pinned to schemaVersion 1 sees exactly the
+// bytes it saw before, and a missing field reads as "unknown boot" rather than as
+// a mismatch.
+func TestBootIDIsAdditiveAndOmittedWhenUnset(t *testing.T) {
+	m := marker.New("anon", "8801", endpoint.ClassTorShared, "0.6.2", time.Now())
+	data, err := m.Marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(data), "bootId") {
+		t.Errorf("a marker with no boot id must emit NO bootId key (additive evolution); got:\n%s", data)
+	}
+
+	stamped := m.WithBootID("9e8d05ee-29bc-418c-9565-d7b8964c87ca")
+	if m.BootID != "" {
+		t.Errorf("WithBootID must not mutate the receiver; original now has BootID=%q", m.BootID)
+	}
+	data, err = stamped.Marshal()
+	if err != nil {
+		t.Fatalf("marshal stamped: %v", err)
+	}
+	back, err := marker.Parse(data)
+	if err != nil {
+		t.Fatalf("parse stamped: %v", err)
+	}
+	if back.BootID != "9e8d05ee-29bc-418c-9565-d7b8964c87ca" {
+		t.Errorf("boot id did not round-trip: got %q", back.BootID)
+	}
+	if back.SchemaVersion != marker.SchemaVersion {
+		t.Errorf("adding a field must not bump the schema version: got %d want %d", back.SchemaVersion, marker.SchemaVersion)
+	}
+}
+
+// A marker written by an OLDER anonctl (no bootId key) still parses cleanly at the
+// same schema version, and reports an empty boot id: unknown, not a mismatch.
+func TestMarkerWithoutBootIDStillParses(t *testing.T) {
+	older := []byte(`{"schemaVersion":1,"account":"anon","uid":"8801","endpointClass":"tor-shared","createdAt":"2026-01-01T00:00:00Z","anonctlVersion":"0.6.1"}`)
+	m, err := marker.Parse(older)
+	if err != nil {
+		t.Fatalf("a pre-bootId marker must still parse: %v", err)
+	}
+	if m.BootID != "" {
+		t.Errorf("a pre-bootId marker must report an EMPTY boot id (unknown); got %q", m.BootID)
+	}
+}
+
+// CurrentBootID reads the kernel's boot id, and fails cleanly (never panics, never
+// returns a bogus value) on a host that has no such file.
+func TestCurrentBootID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "boot_id")
+	if err := os.WriteFile(path, []byte("9e8d05ee-29bc-418c-9565-d7b8964c87ca\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	orig := marker.BootIDPath
+	t.Cleanup(func() { marker.BootIDPath = orig })
+
+	marker.BootIDPath = path
+	got, err := marker.CurrentBootID()
+	if err != nil {
+		t.Fatalf("CurrentBootID: %v", err)
+	}
+	if got != "9e8d05ee-29bc-418c-9565-d7b8964c87ca" {
+		t.Errorf("boot id = %q; want the trimmed file contents", got)
+	}
+
+	marker.BootIDPath = filepath.Join(dir, "absent")
+	if _, err := marker.CurrentBootID(); err == nil {
+		t.Errorf("a host with no boot id file must yield an error, not an empty success")
+	}
+}

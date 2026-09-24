@@ -36,8 +36,66 @@ func TestResolveAccount(t *testing.T) {
 		"  work  ":  "anon-work",
 	}
 	for in, want := range cases {
-		if got := account.ResolveAccount(in); got != want {
+		got, err := account.ResolveAccount(in)
+		if err != nil {
+			t.Errorf("ResolveAccount(%q): unexpected error %v", in, err)
+			continue
+		}
+		if got != want {
 			t.Errorf("ResolveAccount(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Resolution REFUSES a name the egress substrate cannot name unambiguously. The
+// decisive pair is `a_b` vs `a-b`: anonctl rewrites `-` to `_` to build the nft
+// table name, so both would land on `anonctl_anon_a_b` and the second account's
+// `add` would silently replace the first's forcing. Refused at resolution, before
+// anything is provisioned.
+func TestResolveAccountRefusesANameThatIsNotNftInjective(t *testing.T) {
+	bad := []string{
+		"a_b",        // the colliding twin of a-b
+		"anon-a_b",   // the same, already prefixed
+		"Work",       // uppercase
+		"work!",      // punctuation
+		"work space", // an interior space
+		"work-",      // trailing dash
+		"work.d",     // a dot
+		"work/../x",  // a path separator
+	}
+	for _, in := range bad {
+		got, err := account.ResolveAccount(in)
+		if err == nil {
+			t.Errorf("ResolveAccount(%q) = %q with no error; it must REFUSE a name that is not nft-injective", in, got)
+			continue
+		}
+		if got != "" {
+			t.Errorf("ResolveAccount(%q) returned a name %q alongside its error; a refusal must yield no usable name", in, got)
+		}
+	}
+}
+
+// The refusal must NAME ITS REASON. An operator told only "invalid name" will
+// assume anonctl is being fussy; the message has to say that the nft table name is
+// derived from the account and that two names would share one table.
+func TestUnderscoreRefusalNamesTheNftReason(t *testing.T) {
+	_, err := account.ResolveAccount("a_b")
+	if err == nil {
+		t.Fatal("expected a refusal for an underscore name")
+	}
+	msg := err.Error()
+	for _, want := range []string{"nftables", "anonctl_<account>", "table"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the underscore refusal must explain the nft table-name collision; %q is missing from:\n%s", want, msg)
+		}
+	}
+}
+
+// ValidateName accepts the names anonctl actually provisions.
+func TestValidateNameAcceptsRealAccounts(t *testing.T) {
+	for _, name := range []string{"anon", "anon-work", "anon-work-2", "anon-a1", "anon-work-shim"} {
+		if err := account.ValidateName(name); err != nil {
+			t.Errorf("ValidateName(%q) = %v; want accepted", name, err)
 		}
 	}
 }
@@ -78,6 +136,26 @@ func TestChownOperandUsesTheTrailingColonForm(t *testing.T) {
 		// It must name NO group: exactly one colon, at the very end.
 		if strings.Count(got, ":") != 1 || !strings.HasSuffix(got, ":") {
 			t.Errorf("ChownOperand(%q) = %q, want a single TRAILING colon and no group name", name, got)
+		}
+	}
+}
+
+// ResolveAccountLegacy is the deliberate escape hatch for the READ and TEARDOWN
+// path: it performs the same mapping with NO validation, so an account an older
+// build created under a now-refused name stays reachable. The hard guarantee (no
+// colliding ruleset is ever installed) lives in the ruleset generator, not here.
+func TestResolveAccountLegacySkipsValidation(t *testing.T) {
+	if got := account.ResolveAccountLegacy("a_b"); got != "anon-a_b" {
+		t.Errorf("ResolveAccountLegacy(a_b) = %q, want anon-a_b (it must not validate)", got)
+	}
+	// It maps identically to the strict form for every name the strict form accepts.
+	for _, in := range []string{"", "anon", "work", "anon-work", "  work  "} {
+		strict, err := account.ResolveAccount(in)
+		if err != nil {
+			t.Fatalf("ResolveAccount(%q): %v", in, err)
+		}
+		if got := account.ResolveAccountLegacy(in); got != strict {
+			t.Errorf("the two resolvers disagree on %q: strict %q, legacy %q", in, strict, got)
 		}
 	}
 }

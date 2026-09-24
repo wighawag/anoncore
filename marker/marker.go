@@ -18,6 +18,11 @@
 // world-readable marker must never hold a secret; the endpoint URL/creds live in
 // the account's own (non-world-readable) config, never here.
 //
+// The DIRECTORY's 0755 is not this package's to assume: `/etc/anonctl` is shared
+// with the root-only ledger and anonctl's private shim/rules dirs, and whichever
+// store created it first used to decide its mode. It is owned by package
+// configroot now, and Write ensures it through that owner.
+//
 // The `/etc` write is a SHARED/GLOBAL system location, so the base directory is
 // behind a configurable lever (Store.BaseDir): production uses DefaultBaseDir
 // (`/etc/anonctl`); tests point it at a scratch temp dir and assert the real
@@ -35,6 +40,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wighawag/anoncore/configroot"
 	"github.com/wighawag/anoncore/endpoint"
 )
 
@@ -53,15 +59,19 @@ const SchemaVersion = 1
 const DefaultBaseDir = "/etc/anonctl"
 
 const (
-	// dirMode is the marker DIRECTORY mode: 0755, world-readable + world-traversable
-	// so any sibling tool (running as any UID) can reach the marker files. Only root
-	// (anonctl) writes it.
-	dirMode os.FileMode = 0o755
 	// fileMode is the marker FILE mode: 0644, world-READABLE by design (the whole
 	// point is a dependency-free signal any UID can read) but writable only by root.
 	// It holds no secret (credential-free by construction), so world-readable is safe.
 	fileMode os.FileMode = 0o644
 )
+
+// The marker DIRECTORY mode is NOT declared here: the marker dir IS the shared
+// config root (`/etc/anonctl`), which several stores write under, so its mode is
+// owned in ONE place (configroot.Mode, 0755) instead of being a hint each store
+// passes to its own MkdirAll. This package used to pass 0755 to
+// `MkdirAll(baseDir, ...)` and believed it; in production that call was a no-op
+// against a directory the LEDGER had already created 0700, so the documented
+// world-readable contract was false on every box. See package configroot.
 
 // ErrNotFound is returned by Store.Read when there is no marker for the account: a
 // clean "not forced" negative, NOT an I/O failure. A missing marker means the
@@ -94,6 +104,24 @@ type Marker struct {
 	// AnonctlVersion is the anonctl version that wrote the marker, so a consumer /
 	// operator can tell which build made the claim.
 	AnonctlVersion string `json:"anonctlVersion"`
+	// BootID is the kernel boot id (`/proc/sys/kernel/random/boot_id`) of the boot
+	// during which the claim was PROVEN, so a consumer can tell "proven THIS boot"
+	// from "proven some earlier boot".
+	//
+	// It exists because the marker OUTLIVES the proof. The marker is durable, the
+	// nftables state is not: after a reboot the rules are re-loaded by the early-boot
+	// loader and NOTHING is re-verified, so if that load failed the account is
+	// completely unforced while the marker still reads green. Comparing this field
+	// against the live boot id turns that silent case into a visible one (it is what
+	// `anonctl probe` reports as bootMatch), without making the marker a live proof:
+	// a matching boot id still says only "proven during THIS boot", never "forced
+	// right now".
+	//
+	// omitempty, and ADDITIVE at the same schemaVersion (the marker contract evolves
+	// by adding optional fields): a marker written by an older anonctl, or on a host
+	// with no `/proc/sys/kernel/random/boot_id`, simply carries no `bootId`, and a
+	// consumer must read its ABSENCE as "unknown boot", never as a mismatch.
+	BootID string `json:"bootId,omitempty"`
 }
 
 // New builds a Marker for an account at the current SchemaVersion, stamping
@@ -109,6 +137,36 @@ func New(account, uid string, class endpoint.ShareClass, anonctlVersion string, 
 		CreatedAt:      now.UTC().Format(time.RFC3339),
 		AnonctlVersion: anonctlVersion,
 	}
+}
+
+// WithBootID returns a copy of the marker stamped with a kernel boot id. It is a
+// separate copy-method rather than another New parameter so New stays PURE and
+// total (no /proc read, nothing that can fail) and so the boot id stays what it
+// is: an OPTIONAL, additive field a caller supplies when the host can name one.
+func (m Marker) WithBootID(bootID string) Marker {
+	m.BootID = strings.TrimSpace(bootID)
+	return m
+}
+
+// BootIDPath is the kernel's per-boot identifier. It is a package var, not a
+// const, purely so a test can point it at a fixture file; production never
+// changes it.
+var BootIDPath = "/proc/sys/kernel/random/boot_id"
+
+// CurrentBootID reads the kernel boot id of the RUNNING boot. A host that cannot
+// produce one (no procfs) is a clean error the caller reports and proceeds past:
+// the boot id is additive, so failing to read it must never block writing a marker
+// for an account that verify just PROVED forced.
+func CurrentBootID() (string, error) {
+	raw, err := os.ReadFile(BootIDPath)
+	if err != nil {
+		return "", fmt.Errorf("read boot id %q: %w", BootIDPath, err)
+	}
+	id := strings.TrimSpace(string(raw))
+	if id == "" {
+		return "", fmt.Errorf("boot id %q is empty", BootIDPath)
+	}
+	return id, nil
 }
 
 // Marshal renders the marker as the indented JSON written to disk (the wire
@@ -184,7 +242,11 @@ func (s Store) Write(m Marker) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.baseDir(), dirMode); err != nil {
+	// The marker directory IS the shared config root, so ensuring it goes through the
+	// one owner of its mode, which CHMODS explicitly rather than trusting MkdirAll's
+	// mode argument (ignored for an existing directory). That is also what repairs a
+	// box whose `/etc/anonctl` an older build created 0700.
+	if err := configroot.Ensure(s.baseDir()); err != nil {
 		return fmt.Errorf("create marker dir %q: %w", s.baseDir(), err)
 	}
 	if err := os.WriteFile(path, append(data, '\n'), fileMode); err != nil {

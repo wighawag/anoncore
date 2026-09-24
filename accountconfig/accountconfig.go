@@ -31,6 +31,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/wighawag/anoncore/configroot"
 	"github.com/wighawag/anoncore/endpoint"
 )
 
@@ -220,16 +221,37 @@ type Store struct {
 	// BaseDir is the directory holding the `<account>.json` configs. Empty means
 	// DefaultBaseDir, so a zero Store still targets the real path.
 	BaseDir string
+	// RootDir is the SHARED config root (`/etc/anonctl`) that BaseDir lives under,
+	// and whose mode configroot owns. It exists because this store must never be the
+	// thing that decides the shared parent's mode: `MkdirAll(BaseDir, 0700)` used to
+	// create `/etc/anonctl` itself 0700 as a side effect, which silently broke the
+	// marker's world-readable contract for every unprivileged consumer.
+	//
+	// Empty is resolved by configroot.RootFor: the real root when BaseDir is the
+	// default (production), and NO root when BaseDir has been repointed at a scratch
+	// directory, so a test can never make this package chmod a scratch dir's parent.
+	// A test that wants to exercise the REAL layout sets both (RootDir: tmp, BaseDir:
+	// tmp/accounts).
+	RootDir string
 }
 
-// DefaultStore returns the Store pointing at the real DefaultBaseDir.
-func DefaultStore() Store { return Store{BaseDir: DefaultBaseDir} }
+// DefaultStore returns the Store pointing at the real DefaultBaseDir, under the
+// real shared config root.
+func DefaultStore() Store {
+	return Store{BaseDir: DefaultBaseDir, RootDir: configroot.DefaultDir}
+}
 
 func (s Store) baseDir() string {
 	if s.BaseDir == "" {
 		return DefaultBaseDir
 	}
 	return s.BaseDir
+}
+
+// rootDir resolves the config root this store is responsible for ensuring before
+// it creates its own directory (see the RootDir field).
+func (s Store) rootDir() string {
+	return configroot.RootFor(s.RootDir, s.BaseDir, DefaultBaseDir)
 }
 
 // Path returns the config file path for an account (`<BaseDir>/<account>.json`),
@@ -258,7 +280,12 @@ func (s Store) Write(c Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(s.baseDir(), dirMode); err != nil {
+	// Create the SHARED config root first (at the root's own 0755), then this store's
+	// own directory at the private 0700. Going through configroot is what keeps the
+	// ledger from creating `/etc/anonctl` 0700 as a side effect of its own MkdirAll -
+	// and the explicit per-directory chmod is what keeps a traversable root from
+	// widening this directory, which holds the endpoint records.
+	if err := configroot.EnsureUnder(s.rootDir(), s.baseDir(), dirMode); err != nil {
 		return fmt.Errorf("create account-config dir %q: %w", s.baseDir(), err)
 	}
 	if err := os.WriteFile(path, append(data, '\n'), fileMode); err != nil {

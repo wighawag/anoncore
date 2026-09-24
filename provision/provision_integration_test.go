@@ -37,7 +37,10 @@ func TestRealProvisionRoundTrip(t *testing.T) {
 
 	ctx := context.Background()
 	r := provision.ExecRunner{}
-	account := acct.ResolveAccount("anonctlitest")
+	account, err := acct.ResolveAccount("anonctlitest")
+	if err != nil {
+		t.Fatalf("resolve account: %v", err)
+	}
 	shim := acct.ShimAccount(account)
 
 	// Guarantee cleanup even if an assertion below fails: always purge the account
